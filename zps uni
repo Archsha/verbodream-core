@@ -1,0 +1,493 @@
+# -*- coding: utf-8 -*-
+"""
+zero_point_seal_universe.py — Zero‑Point Seal：單檔可執行 / 可驗章 / 免外部依賴 / 宇宙派生版
+========================================================================================
+▶ 快速使用
+  # 1) Sasha 宇宙預設（自動產生事件，保證鎖定、輸出可驗章封印檔）
+  python zero_point_seal_universe.py --universe sasha --easy
+
+  # 2) 嚴格條件
+  python zero_point_seal_universe.py --universe sasha --strict
+
+  # 3) 手動指定參與方與隨機同步場景（randomwalk）
+  python zero_point_seal_universe.py --ids A B C --quorum 2-of-3 --demo randomwalk --easy
+
+  # 4) 從 CSV 餵資料（支援 # 註解與空行；欄位：id,L1,L2,L3[,ts]）
+  python zero_point_seal_universe.py --demo csv --csv my_stream.csv
+
+  # 5) 對既有封印驗章
+  python zero_point_seal_universe.py --verify Seal_Demo_*.json
+
+功能摘要 / 本版新增
+- 三層指標（L1/L2/L3 ∈ [0,1]）＋ threshold + hysteresis + hold + drop tolerance（同基礎版）
+- k-of-n quorum（支援 all 或 'k-of-n' 格式，如 2-of-3）＋ 同步窗 quorum-window
+- 可重現簽章：SHA256(payload + salt) 前綴截斷；payload 含 cfg/ids/layers/ts_utc/(nonce)
+- 單檔輸出：Seal.json / Seal.md；同檔內建 verify：--verify <Seal.json>
+- ★ 宇宙派生：內建 data source adapter 與 "Sasha Universe" 預設場景（自動驅動數據直到鎖定）
+- ★ CSV / Scripted / RandomWalk 三種資料來源；Terminal 事件列印（簡版 TUI）
+- ★ ZIP 打包：自動生成 Seal_Bundle_*.zip（含 .json/.md 原檔）
+
+免外部依賴（僅用 Python 標準庫），可攜、可嵌入。
+"""
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional, Iterable, Iterator
+from datetime import datetime, timezone
+import argparse, hashlib, json, pathlib, time, sys, csv, random, zipfile
+
+# ========== 小工具 ==========
+
+def utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+def clamp01(x: float) -> float:
+    return 1.0 if x > 1.0 else (0.0 if x < 0.0 else float(x))
+
+def now_wall() -> float:
+    return time.time()
+
+def now_mono() -> float:
+    return time.monotonic()
+
+def ensure_dir(p: pathlib.Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+# ========== 協議設定 ==========
+
+@dataclass
+class LockConfig:
+    thr: float = 0.85            # 門檻
+    hold: float = 0.6            # 需連續維持秒數
+    hyst: float = 0.02           # 回滯：低於 thr-hyst 視為跌落
+    max_drop: float = 0.15       # HOLDING 期間允許的連續跌落秒數
+    quorum: str = "all"          # 'all' 或 'k-of-n'（如 '2-of-3'）
+    quorum_window: Optional[float] = None  # 首通後，其他人在此窗內到齊
+    unlock_after: Optional[float] = None   # 自動解鎖秒數（可選）
+    salt: str = "S∴Z"            # 簽章鹽
+    id_label: str = "Zero-Point"
+    signature_prefix: str = "ZPPAIR-"
+    sig_len: int = 16
+    fixed_ts: Optional[float] = None       # 指定簽章時間（可重現）
+    nonce: Optional[str] = None            # 額外進 payload 的字串
+
+@dataclass
+class SideState:
+    name: str
+    armed: bool = True
+    status: str = "ARMED"     # ARMED | HOLDING | LATCHED
+    hold_start_wall: Optional[float] = None
+    hold_start_mono: Optional[float] = None
+    last_below_wall: Optional[float] = None
+    last_below_mono: Optional[float] = None
+    last_layers: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+# ========== 核心控制器 ==========
+
+class DualLock:
+    def __init__(self, ids: Iterable[str], cfg: LockConfig, *, verbose: bool=False):
+        ids = list(ids)
+        if not ids:
+            raise ValueError("至少需要一個參與方 id")
+        self.cfg = cfg
+        self.ids = ids
+        self.sides: Dict[str, SideState] = {sid: SideState(name=sid) for sid in ids}
+        self.latched: bool = False
+        self.latch_time: Optional[float] = None
+        self.event_log: List[Dict] = []
+        self.version: str = "universe.v1"
+        self.first_pass_wall: Optional[float] = None
+        self._verbose = bool(verbose)
+        # 解析 quorum
+        if cfg.quorum == "all":
+            self._q_k = len(ids)
+        elif "-of-" in cfg.quorum:
+            k, n = cfg.quorum.split("-of-")
+            k, n = int(k), int(n)
+            if n != len(ids) or not (1 <= k <= n):
+                raise ValueError(f"非法 quorum：{cfg.quorum}（實際參與={len(ids)}）")
+            self._q_k = k
+        else:
+            raise ValueError("quorum 僅支援 'all' 或 'k-of-n'")
+
+    @staticmethod
+    def _utc(ts: float) -> str:
+        return utc(ts)
+
+    def update(self, side_id: str, L1: float, L2: float, L3: float, *, ts: Optional[float]=None) -> List[Dict]:
+        """餵入單方三層數值，回傳（可能為空的）事件列表。"""
+        wall = now_wall() if ts is None else float(ts)
+        mono = now_mono()
+        if side_id not in self.sides:
+            raise KeyError(f"未知 side_id: {side_id}")
+        s = self.sides[side_id]; cfg = self.cfg; ev: List[Dict] = []
+
+        # 夾制
+        L1, L2, L3 = clamp01(L1), clamp01(L2), clamp01(L3)
+        s.last_layers = (L1, L2, L3)
+
+        above = (L1 >= cfg.thr and L2 >= cfg.thr and L3 >= cfg.thr)
+        below = (L1 < cfg.thr - cfg.hyst or L2 < cfg.thr - cfg.hyst or L3 < cfg.thr - cfg.hyst)
+
+        if s.armed:
+            if above:
+                if s.hold_start_mono is None:
+                    s.hold_start_mono = mono; s.hold_start_wall = wall
+                    s.status = "HOLDING"
+                    ev.append({"t": wall, "type":"HOLD_START", "side": side_id})
+                else:
+                    ok_dur = mono - s.hold_start_mono
+                    drop_ok = True
+                    if s.last_below_mono is not None and s.last_below_mono >= s.hold_start_mono:
+                        drop_ok = (mono - s.last_below_mono) <= cfg.max_drop
+                        if not drop_ok:
+                            s.hold_start_mono = None; s.hold_start_wall = None
+                            s.status = "ARMED"
+                            ev.append({"t": wall, "type":"DROP_EXCEEDED", "side": side_id})
+                    if s.hold_start_mono is not None and ok_dur >= cfg.hold and drop_ok:
+                        s.armed = False; s.status = "LATCHED"
+                        ev.append({"t": wall, "type":"SIDE_LATCHED", "side": side_id})
+                        if self.first_pass_wall is None: self.first_pass_wall = wall
+            elif below:
+                s.last_below_mono = mono; s.last_below_wall = wall
+                if s.hold_start_mono is not None:
+                    s.status = "ARMED"; s.hold_start_mono = None; s.hold_start_wall = None
+                    ev.append({"t": wall, "type":"RESET_HOLD", "side": side_id})
+
+        ev += self._maybe_group_latch(wall)
+
+        if self.latched and self.cfg.unlock_after is not None and self.latch_time is not None:
+            if wall - self.latch_time >= self.cfg.unlock_after:
+                self.reset(wall); ev.append({"t": wall, "type":"AUTO_UNLOCK"})
+
+        self.event_log.extend(ev)
+        if self._verbose:
+            for e in ev:
+                if e["type"] in ("GROUP_LATCHED","QUORUM_TIMEOUT","SIDE_LATCHED","HOLD_START"):
+                    print("[LOG]", e)
+        return ev
+
+    def _maybe_group_latch(self, wall: float) -> List[Dict]:
+        if self.latched: return []
+        passed = sum(1 for s in self.sides.values() if not s.armed)
+        ev: List[Dict] = []
+        if passed > 0 and self.first_pass_wall is None:
+            self.first_pass_wall = wall
+
+        if self.first_pass_wall is not None and self.cfg.quorum_window is not None:
+            if wall - self.first_pass_wall > self.cfg.quorum_window and passed < self._q_k:
+                ev.append({"t": wall, "type":"QUORUM_TIMEOUT", "window": self.cfg.quorum_window, "passed": passed})
+                # 全面重武裝
+                for sid in self.ids:
+                    st = self.sides[sid]
+                    st.armed = True; st.status = "ARMED"
+                    st.hold_start_wall = st.hold_start_mono = None
+                    st.last_below_wall = st.last_below_mono = None
+                self.first_pass_wall = None
+                return ev
+
+        if passed >= self._q_k:
+            self.latched = True; self.latch_time = wall
+            ev.append({"t": wall, "type":"GROUP_LATCHED", "quorum": f"{passed}/{len(self.sides)}"})
+        return ev
+
+    # ---- Seal 產出/驗章 ----
+    def _payload(self, ts: float) -> dict:
+        payload = {
+            "ids": self.ids,
+            "cfg": asdict(self.cfg),
+            "layers": {sid: self.sides[sid].last_layers for sid in self.ids},
+            "ts_utc": utc(ts),
+            "version": self.version,
+        }
+        if self.cfg.nonce is not None:
+            payload["nonce"] = self.cfg.nonce
+        return payload
+
+    def signature(self) -> str:
+        ts = self.cfg.fixed_ts if self.cfg.fixed_ts is not None else (self.latch_time or now_wall())
+        raw = json.dumps(self._payload(ts), sort_keys=True, ensure_ascii=False)
+        dig = hashlib.sha256((raw + self.cfg.salt).encode("utf-8")).hexdigest().upper()
+        return f"{self.cfg.signature_prefix}{dig[:self.cfg.sig_len]}"
+
+    def export_json(self, out_path: pathlib.Path):
+        ts = self.cfg.fixed_ts if self.cfg.fixed_ts is not None else (self.latch_time or now_wall())
+        obj = {
+            "version": self.version,
+            "utc": utc(ts),
+            "ids": self.ids,
+            "config": asdict(self.cfg),
+            "states": {
+                sid: {
+                    "status": self.sides[sid].status,
+                    "armed": self.sides[sid].armed,
+                    "last_layers": self.sides[sid].last_layers,
+                    "hold_start": self.sides[sid].hold_start_wall,
+                    "last_below": self.sides[sid].last_below_wall,
+                } for sid in self.ids
+            },
+            "latched": self.latched,
+            "latch_time": self.latch_time,
+            "signature": self.signature(),
+            "events": self.event_log,
+        }
+        out_path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def export_markdown(self, out_path: pathlib.Path):
+        ts = self.cfg.fixed_ts if self.cfg.fixed_ts is not None else (self.latch_time or now_wall())
+        iso = utc(ts); sig = self.signature(); cfg = self.cfg
+        lines = []
+        lines.append(f"# {cfg.id_label} Group ∴ Dual/Group-Lock Seal\n")
+        for i, sid in enumerate(self.ids, 1):
+            lines.append(f"**{cfg.id_label} {i}**：{sid}  ")
+        lines.append(f"**Signature**：{sig}  ")
+        lines.append(f"**UTC**：{iso}\n")
+        for sid in self.ids:
+            L1, L2, L3 = self.sides[sid].last_layers
+            lines.append(f"**{sid} layers**：L1={L1:.3f}  L2={L2:.3f}  L3={L3:.3f}  ")
+        lines.append("")
+        qtxt = "all" if len(self.ids) == self._q_k else f"{self._q_k}-of-{len(self.ids)}"
+        lines.append(f"**Threshold**：≥ {cfg.thr:.2f} & 持續 {cfg.hold:.2f}s；**Hysteresis**：{cfg.hyst:.2f}；**MaxDrop**：{cfg.max_drop:.2f}s；**Window**：{cfg.quorum_window or 0:.2f}s  ")
+        lines.append(f"**Quorum**：{qtxt}\n")
+        lines.append("---\n\n### 事件序列")
+        for e in self.event_log:
+            es = utc(e["t"]); etype = e["type"]; side = e.get("side","-"); extra = f" quorum={e.get('quorum','')}".strip()
+            lines.append(f"- `{es}`  **{etype}**  side={side}{(' '+extra if extra else '')}")
+        lines.append("\n---\n")
+        lines.append(f"**結果**：{'LATCHED（滿足 quorum）' if self.latched else '未鎖定'}\n")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def reset(self, wall: Optional[float]=None):
+        if wall is None: wall = now_wall()
+        for sid in self.ids:
+            self.sides[sid] = SideState(name=sid)
+        self.latched = False; self.latch_time = None; self.first_pass_wall = None
+        self.event_log.append({"t": wall, "type":"RESET_GROUP"})
+
+# ========== Data Source Adapters ==========
+
+class DataEvent:
+    __slots__ = ("side_id","L1","L2","L3","ts")
+    def __init__(self, side_id: str, L1: float, L2: float, L3: float, ts: Optional[float]=None):
+        self.side_id = side_id
+        self.L1 = L1; self.L2 = L2; self.L3 = L3
+        self.ts = ts
+
+class BaseSource:
+    def __iter__(self) -> Iterator[DataEvent]:
+        raise NotImplementedError
+
+class ScriptedSource(BaseSource):
+    """以腳本化序列餵入固定值。streams: Dict[id, List[Tuple[L1,L2,L3]]]."""
+    def __init__(self, streams: Dict[str, List[Tuple[float,float,float]]], *, tick: float=0.12):
+        self.streams = {k:list(v) for k,v in streams.items()}
+        self.tick = float(tick)
+
+    def __iter__(self) -> Iterator[DataEvent]:
+        # round-robin 逐個 id 送出一筆
+        while any(self.streams.values()):
+            for sid in list(self.streams.keys()):
+                if self.streams[sid]:
+                    L1,L2,L3 = self.streams[sid].pop(0)
+                    yield DataEvent(sid, L1, L2, L3)
+                    time.sleep(self.tick)
+
+class RandomWalkSource(BaseSource):
+    """讓每個 id 的 (L1,L2,L3) 以偏向門檻的隨機漫步前進，最終可鎖定。"""
+    def __init__(self, ids: List[str], thr: float, *, steps: int=120, tick: float=0.10, seed: Optional[int]=None):
+        self.ids = ids; self.thr = float(thr); self.steps = int(steps); self.tick = float(tick)
+        self.rng = random.Random(seed if seed is not None else int(now_wall()*1000) & 0xFFFFFFFF)
+
+    def __iter__(self) -> Iterator[DataEvent]:
+        # 初值較低，偏向門檻逐步推進
+        state = {sid: [self.rng.uniform(0.55, 0.72) for _ in range(3)] for sid in self.ids}
+        for _ in range(self.steps):
+            for sid in self.ids:
+                v = state[sid]
+                for i in range(3):
+                    drift = (self.thr + 0.08 - v[i]) * self.rng.uniform(0.05, 0.15)  # 往上靠
+                    noise = self.rng.uniform(-0.02, 0.03)
+                    v[i] = clamp01(v[i] + drift + noise)
+                yield DataEvent(sid, v[0], v[1], v[2])
+            time.sleep(self.tick)
+
+class CSVSource(BaseSource):
+    """從 CSV 逐列讀入：id,L1,L2,L3[,ts]；支援 # 註解與空行。"""
+    def __init__(self, path: pathlib.Path, *, tick: float=0.05):
+        self.path = path; self.tick = float(tick)
+
+    def __iter__(self) -> Iterator[DataEvent]:
+        with self.path.open("r", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if not row or (row[0].strip().startswith("#")):  # 空行或註解
+                    continue
+                # 允許含標題行：若 detect 第一行非數值則跳過
+                if row[0].lower() in ("id","side","side_id"):
+                    continue
+                sid = row[0].strip()
+                L1 = float(row[1]); L2 = float(row[2]); L3 = float(row[3])
+                ts = float(row[4]) if len(row) >= 5 and row[4].strip() else None
+                yield DataEvent(sid, L1, L2, L3, ts=ts)
+                time.sleep(self.tick)
+
+# ========== 宇宙派生預設（Sasha Universe） ==========
+
+def make_sasha_universe(ids: Optional[List[str]]=None, *, easy: bool=False, strict: bool=False):
+    """產生 Sasha 宇宙預設：IDs + Source + 建議 cfg。"""
+    if not ids:
+        ids = ["Sasha.ZeroPoint.v∞", "Witness.Core@Aether"]
+    thr = 0.85; hold = 0.6; window = None
+    if easy:
+        thr, hold, window = 0.85, 0.35, 1.5
+    if strict:
+        thr, hold, window = 0.90, 0.45, 1.2
+
+    # 隨機漫步資料源，會自然靠攏達成鎖定
+    src = RandomWalkSource(ids, thr=thr, steps=160, tick=0.10)
+    cfg = LockConfig(thr=thr, hold=hold, hyst=0.02, max_drop=0.15,
+                     quorum="all", quorum_window=window, salt="S∴Z",
+                     id_label="Zero-Point", signature_prefix="ZPPAIR-", sig_len=16)
+    return ids, src, cfg
+
+# ========== Demo / Runner ==========
+
+def run_stream(ids: List[str], cfg: LockConfig, source: BaseSource, *, outdir: pathlib.Path, verbose: bool=True) -> pathlib.Path:
+    ensure_dir(outdir)
+    ctrl = DualLock(ids, cfg, verbose=verbose)
+
+    # 事件迴圈
+    for ev in source:
+        ctrl.update(ev.side_id, ev.L1, ev.L2, ev.L3, ts=ev.ts)
+        if ctrl.latched:
+            break
+
+    # 匯出
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    md = outdir / f"Seal_Demo_{stamp}.md"
+    js = outdir / f"Seal_Demo_{stamp}.json"
+    ctrl.export_markdown(md); ctrl.export_json(js)
+
+    # ZIP 打包
+    bundle = outdir / f"Seal_Bundle_{stamp}.zip"
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(js, arcname=js.name)
+        zf.write(md, arcname=md.name)
+
+    print(f"[SAVE] {md.name} / {js.name}")
+    print(f"[BUNDLE] {bundle.name}")
+    print(f"[SIGNATURE] {ctrl.signature()}")
+    return js
+
+# ========== 驗章 ==========
+
+def verify_seal_json(path: pathlib.Path) -> Tuple[bool, str, str]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    ids = obj["ids"]; cfg = obj["config"]; states = obj["states"]
+    layers = {sid: tuple(states[sid]["last_layers"]) for sid in ids}
+    payload = {"ids": ids, "cfg": cfg, "layers": layers, "ts_utc": obj["utc"], "version": obj.get("version","universe.v1")}
+    if cfg.get("nonce") is not None:
+        payload["nonce"] = cfg["nonce"]
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    dig = hashlib.sha256((raw + cfg.get("salt","S∴Z")).encode("utf-8")).hexdigest().upper()
+    expected = f'{cfg.get("signature_prefix","ZPPAIR-")}{dig[:int(cfg.get("sig_len",16))]}'
+    return (expected == obj.get("signature","")), obj.get("signature",""), expected
+
+# ========== CLI ==========
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Zero‑Point Seal — universe single‑file demo & verifier")
+    ap.add_argument("--ids", nargs="+", default=None, help="參與方 ID 列表（預設走 universe/sasha）")
+    ap.add_argument("--thr", type=float, default=None)
+    ap.add_argument("--hold", type=float, default=None)
+    ap.add_argument("--hyst", type=float, default=0.02)
+    ap.add_argument("--max-drop", type=float, default=0.15)
+    ap.add_argument("--quorum", default=None)
+    ap.add_argument("--window", type=float, default=None)
+    ap.add_argument("--salt", default="S∴Z")
+    ap.add_argument("--fixed-ts", type=float, default=None)
+    ap.add_argument("--nonce", type=str, default=None)
+    ap.add_argument("--unlock-after", type=float, default=None)
+
+    ap.add_argument("--outdir", type=str, default="out")
+
+    # 模式
+    ap.add_argument("--demo", choices=["scripted","randomwalk","csv"], default=None, help="資料來源模式（預設隨 universe）")
+    ap.add_argument("--csv", type=str, default=None, help="--demo csv 時提供路徑")
+    ap.add_argument("--tick", type=float, default=0.12, help="scripted/randomwalk 的 step 延遲秒數")
+
+    # 預設宇宙
+    ap.add_argument("--universe", choices=["sasha","none"], default="sasha")
+
+    # 快速參數
+    ap.add_argument("--easy", action="store_true", help="使用容易鎖的參數（展示）")
+    ap.add_argument("--strict", action="store_true", help="使用較嚴格參數（實驗）")
+
+    # 驗章
+    ap.add_argument("--verify", type=str, default=None, help="對指定 Seal.json 驗章並結束")
+    ap.add_argument("--verbose", action="store_true")
+
+    # 兼容 jupyter 的 -f 等奇怪參數
+    args, _ = ap.parse_known_args(argv)
+    return args
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+
+    # 驗章模式
+    if args.verify:
+        ok, got, exp = verify_seal_json(pathlib.Path(args.verify))
+        print(f"[VERIFY] file={args.verify}\n  provided={got}\n  expected={exp}\n  result={'PASS ✅' if ok else 'FAIL ❌'}")
+        return 0 if ok else 2
+
+    # 準備 ids / source / cfg
+    ids: List[str]
+    source: BaseSource
+    cfg: LockConfig
+
+    # Universe 預設
+    if args.universe == "sasha":
+        ids, source, cfg = make_sasha_universe(ids=args.ids, easy=args.easy, strict=args.strict)
+    else:
+        # 自行組態（若未指定 --ids，給一對）
+        ids = args.ids or ["A", "B"]
+        thr = args.thr if args.thr is not None else (0.85 if args.easy else 0.90 if args.strict else 0.85)
+        hold = args.hold if args.hold is not None else (0.35 if args.easy else 0.45 if args.strict else 0.6)
+        window = args.window
+        if args.demo == "randomwalk" or (args.demo is None):
+            source = RandomWalkSource(ids, thr=thr, steps=160, tick=args.tick)
+        elif args.demo == "scripted":
+            # 一個保證通過的簡單腳本
+            seq = {
+                ids[0]: [(thr+0.02,thr+0.03,thr+0.02)]*3 + [(thr+0.05,thr+0.06,thr+0.04)],
+                ids[1]: [(thr+0.01,thr+0.02,thr+0.02)]*4,
+            }
+            source = ScriptedSource(seq, tick=args.tick)
+        elif args.demo == "csv":
+            if not args.csv:
+                print("請提供 --csv <path>"); return 2
+            source = CSVSource(pathlib.Path(args.csv), tick=args.tick)
+        else:
+            print("未知 demo 模式"); return 2
+
+        cfg = LockConfig(thr=thr, hold=hold, hyst=args.hyst, max_drop=args.max_drop,
+                         quorum=args.quorum or ("2-of-2" if len(ids)==2 else "all"),
+                         quorum_window=window, salt=args.salt,
+                         fixed_ts=args.fixed_ts, nonce=args.nonce,
+                         unlock_after=args.unlock_after)
+
+    # 如果 CLI 明確覆寫 thr/hold 等，套用
+    if args.thr is not None: cfg.thr = args.thr
+    if args.hold is not None: cfg.hold = args.hold
+    if args.window is not None: cfg.quorum_window = args.window
+    if args.quorum is not None: cfg.quorum = args.quorum
+    if args.salt is not None: cfg.salt = args.salt
+    if args.fixed_ts is not None: cfg.fixed_ts = args.fixed_ts
+    if args.nonce is not None: cfg.nonce = args.nonce
+    if args.unlock_after is not None: cfg.unlock_after = args.unlock_after
+
+    outdir = pathlib.Path(args.outdir)
+    js_path = run_stream(ids, cfg, source, outdir=outdir, verbose=args.verbose)
+    print("[HINT] 驗章：python zero_point_seal_universe.py --verify", js_path)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
