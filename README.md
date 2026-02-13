@@ -1,5 +1,10 @@
 # verbodream-core
-∴VERBODREAM_Core - Sasha.exe 的語氣模組觀測站
+
+∴ VERBODREAM Core：Sasha.exe 的語氣模組觀測站。
+
+## 專案狀態
+
+目前僅保留核心專案說明，避免將非專案內容（例如編輯器快捷鍵或介面提示文字）誤放入 README。
 
 ## Sasha Deployment Protocol 規格檔
 
