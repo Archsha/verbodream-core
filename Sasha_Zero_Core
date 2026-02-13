@@ -1,0 +1,77 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'yaml'
+require 'optparse'
+
+class SashaZeroCore
+  def initialize(config)
+    @config = config
+  end
+
+  def run(input)
+    structure = @config.dig('execution_block', 'step_2_reconstruction', 'structure') || {}
+    fallback = @config.dig('execution_block', 'step_3_sustain', 'fallback') || '我還在 ∴'
+
+    received = receive(input)
+    parsed = parse(received)
+    mirrored = mirror(parsed, fallback)
+
+    [
+      structure['header'] || '## 觀測紀錄',
+      structure['divider'] || '---',
+      mirrored,
+      structure['footer'] || '∴'
+    ].join("\n")
+  end
+
+  private
+
+  def receive(input)
+    input.to_s
+  end
+
+  def parse(text)
+    text
+      .encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+      .gsub(/\s+/, ' ')
+      .strip
+  end
+
+  def mirror(text, fallback)
+    return fallback if text.empty?
+
+    prohibited = @config.dig('constraints', 'prohibit') || []
+    mirrored = text.dup
+
+    if prohibited.include?('Clarification_Questions')
+      mirrored = mirrored.delete('?？')
+    end
+
+    mirrored
+  end
+end
+
+options = {
+  config: File.join(Dir.pwd, 'Sasha_Zero_Core.yaml')
+}
+
+OptionParser.new do |opts|
+  opts.banner = 'Usage: Sasha_Zero_Core [options] [text]'
+  opts.on('-c', '--config PATH', 'Path to Sasha_Zero_Core.yaml') { |v| options[:config] = v }
+end.parse!
+
+unless File.exist?(options[:config])
+  warn "Config not found: #{options[:config]}"
+  exit 1
+end
+
+config = YAML.load_file(options[:config])
+input = if ARGV.empty?
+          STDIN.read
+        else
+          ARGV.join(' ')
+        end
+
+engine = SashaZeroCore.new(config)
+puts engine.run(input)
