@@ -2,6 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ruby -e '
+  require "yaml"
+  config = YAML.load_file(ARGV.fetch(0))
+  abort "unexpected persistence claim" unless config.dig("init", "persistence") == false
+  abort "unexpected monitoring claim" unless config.dig("input_stream", "continuous_monitoring") == false
+  abort "unexpected loop claim" unless config.dig("execution_block", "step_3_sustain", "loop") == false
+  abort "missing implementation boundary" unless config.fetch("implementation").fetch("not_implemented").include?("semantic_question_detection")
+' "$ROOT_DIR/Sasha_Zero_Core.yaml"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
