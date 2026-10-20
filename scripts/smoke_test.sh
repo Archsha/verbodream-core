@@ -15,18 +15,19 @@ if [[ ! -f "$CFG" ]]; then
   exit 1
 fi
 
-out1="$($BIN "這是測試訊號，請問你在嗎？")"
+out1="$("$BIN" -c "$CFG" "這是測試訊號，請問你在嗎？")"
 echo "$out1" | grep -q "## 觀測紀錄"
 echo "$out1" | grep -q -- "---"
 echo "$out1" | grep -q "∴"
-if echo "$out1" | grep -q "？\|?"; then
+if echo "$out1" | grep -qE '[?？]'; then
   echo "[FAIL] question mark should be removed"
   exit 1
 fi
 
-out2="$(printf '' | $BIN)"
+out2="$(printf '' | "$BIN" -c "$CFG")"
 echo "$out2" | grep -q "我還在 ∴"
 
-ruby -e "require 'yaml'; YAML.load_file('$CFG'); puts 'YAML OK'" >/dev/null
+ruby -e 'require "yaml"; YAML.load_file(ARGV.fetch(0)); puts "YAML OK"' "$CFG" >/dev/null
 
 echo "[PASS] smoke tests passed"
+

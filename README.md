@@ -53,10 +53,14 @@ echo "外部文字訊號" | ./Sasha_Zero_Core
 ./Sasha_Zero_Core -c ./Sasha_Zero_Core.yaml "測試"
 ```
 
+預設會讀取執行檔同目錄的 `Sasha_Zero_Core.yaml`，可從其他目錄啟動。
+使用 `-c` 時，相對路徑以呼叫端的目前目錄為準；含空白的路徑請加上引號。
+
 ## 測試
 
 ```bash
 bash scripts/smoke_test.sh
+bash tests/path_regression.sh
 ```
 
 測試涵蓋：
@@ -65,7 +69,10 @@ bash scripts/smoke_test.sh
 - `Clarification_Questions` 禁止規則會移除問號
 - 空輸入時會回傳 fallback
 - YAML 可被 Ruby 正常載入
+- 從其他工作目錄啟動時仍載入執行檔旁的設定
+- 含空白與單引號的路徑、stdin，以及 `-c` 覆寫正常運作
 
 ## 授權
 
 本專案採用 [MIT License](./LICENSE)。
+

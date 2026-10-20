@@ -53,7 +53,7 @@ class SashaZeroCore
 end
 
 options = {
-  config: File.join(Dir.pwd, 'Sasha_Zero_Core.yaml')
+  config: File.join(__dir__, 'Sasha_Zero_Core.yaml')
 }
 
 OptionParser.new do |opts|
@@ -75,3 +75,4 @@ input = if ARGV.empty?
 
 engine = SashaZeroCore.new(config)
 puts engine.run(input)
+
